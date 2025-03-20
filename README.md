@@ -111,6 +111,7 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 **Option A: Using Git**
 
 bash
+
 Clone the repository
 git clone https://github.com/your-username/AML-Project-team-L.git
 cd AML-Project-team-L
