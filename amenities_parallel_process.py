@@ -6,6 +6,8 @@ from datetime import datetime
 import os
 from tqdm import tqdm
 import json
+import concurrent.futures
+import numpy as np
 
 def get_batch_start_index(output_file):
     """Determine the starting index by checking existing output file"""
@@ -20,7 +22,33 @@ def save_checkpoint(processed_data, output_file, mode='a'):
     header = not os.path.exists(output_file) if mode == 'a' else True
     df.to_csv(output_file, mode=mode, header=header, index=False)
 
-def process_locations_in_batches(input_file, output_file, batch_size=100):
+def process_location(args):
+    """Process a single location - designed for parallel execution"""
+    row, categories = args
+    row_results = {}
+    row_results.update(row)  # Keep original data
+    
+    try:
+        for category in categories:
+            count, nearest_distance = get_nearby_places(
+                row['Latitude'], 
+                row['Longitude'], 
+                category
+            )
+            row_results[f'Number_of_{category.capitalize()}_Nearby'] = count
+            row_results[f'Distance_to_Nearest_{category.capitalize()}_miles'] = nearest_distance
+        
+        # Add small random delay to avoid exact simultaneous requests
+        time.sleep(0.2 + np.random.random() * 0.3)  # Random delay between 0.2-0.5 seconds
+        return row_results
+        
+    except Exception as e:
+        print(f"Error processing row: {str(e)}")
+        # Save error information
+        row_results['processing_error'] = str(e)
+        return row_results
+
+def process_locations_in_batches(input_file, output_file, batch_size=100, max_workers=8):
     # Read input data
     df = pd.read_csv(input_file)
     total_rows = len(df)
@@ -42,29 +70,21 @@ def process_locations_in_batches(input_file, output_file, batch_size=100):
         print(f"\nProcessing batch {batch_start//batch_size + 1}: rows {batch_start} to {batch_end}")
         start_time = datetime.now()
         
+        # Prepare arguments for parallel processing
+        args_list = [(row.to_dict(), categories) for _, row in batch.iterrows()]
+        
         results = []
-        for idx, row in tqdm(batch.iterrows(), total=len(batch)):
-            row_results = {}
-            row_results.update(row.to_dict())  # Keep original data
+        # Use ThreadPoolExecutor for I/O-bound operations
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(process_location, args) for args in args_list]
             
-            try:
-                for category in categories:
-                    count, nearest_distance = get_nearby_places(
-                        row['Latitude'], 
-                        row['Longitude'], 
-                        category
-                    )
-                    row_results[f'Number_of_{category.capitalize()}_Nearby'] = count
-                    row_results[f'Distance_to_Nearest_{category.capitalize()}_miles'] = nearest_distance
-                
-                results.append(row_results)
-                time.sleep(1)  # Rate limiting
-                
-            except Exception as e:
-                print(f"Error processing row {idx}: {str(e)}")
-                # Save error information
-                row_results['processing_error'] = str(e)
-                results.append(row_results)
+            # Process results as they complete with progress bar
+            for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures)):
+                try:
+                    result = future.result()
+                    results.append(result)
+                except Exception as e:
+                    print(f"Error in worker thread: {str(e)}")
         
         # Save batch results
         save_checkpoint(results, output_file)
@@ -181,6 +201,7 @@ if __name__ == "__main__":
     INPUT_FILE = "data/geocode.csv"
     OUTPUT_FILE = "places_analysis_results.csv"
     BATCH_SIZE = 100
+    MAX_WORKERS = 8  # Adjust based on your system capabilities and API rate limits
     
     # Categories (from your original code)
     categories = [
@@ -189,15 +210,15 @@ if __name__ == "__main__":
         "museums", "libraries", "grocery_stores"
     ]
     
-    print(f"Starting batch processing of {INPUT_FILE}")
+    print(f"Starting parallel batch processing of {INPUT_FILE}")
     print(f"Results will be saved to {OUTPUT_FILE}")
-    print(f"Batch size: {BATCH_SIZE}")
+    print(f"Batch size: {BATCH_SIZE}, Max workers: {MAX_WORKERS}")
     
     try:
-        process_locations_in_batches(INPUT_FILE, OUTPUT_FILE, BATCH_SIZE)
+        process_locations_in_batches(INPUT_FILE, OUTPUT_FILE, BATCH_SIZE, MAX_WORKERS)
         print("\nProcessing completed successfully!")
     except KeyboardInterrupt:
         print("\nProcessing interrupted by user. Progress has been saved.")
     except Exception as e:
         print(f"\nAn error occurred: {str(e)}")
-        print("Progress has been saved and can be resumed from the last successful batch.") 
+        print("Progress has been saved and can be resumed from the last successful batch.")
