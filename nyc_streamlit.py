@@ -2,6 +2,7 @@
 import streamlit as st
 import requests
 from geopy.distance import geodesic
+from geopy.geocoders import Nominatim
 import folium
 from streamlit_folium import st_folium
 import pandas as pd
@@ -15,7 +16,7 @@ from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error, e
 from datetime import datetime
 
 # -------------------------------
-# 📊 Define Category Filters
+# 📊 Category Filters for Amenities
 # -------------------------------
 CATEGORY_FILTERS = {
     "Parks": '["leisure"="park"]',
@@ -35,11 +36,14 @@ CATEGORY_FILTERS = {
 }
 
 # -------------------------------
-# 🧠 Train DNN Model Inside App
+# 🧠 Train DNN Model
 # -------------------------------
 @st.cache_resource
 def train_dnn_model():
     df = pd.read_csv("Fully_cleaned.csv")
+
+    zipcode_safety_mapping = df[['Zip Code', 'Safety_Score']].dropna().drop_duplicates()
+    zipcode_to_safety = dict(zip(zipcode_safety_mapping['Zip Code'], zipcode_safety_mapping['Safety_Score']))
 
     df['bed'] = pd.to_numeric(df['bed'], errors='coerce')
     df['bath'] = df['bath'].replace(r'\+', '', regex=True)
@@ -86,7 +90,6 @@ def train_dnn_model():
         callbacks=[early_stopping]
     )
 
-    # Predict and calculate metrics
     y_pred_log = model.predict(X_test_scaled).flatten()
     y_pred = np.expm1(y_pred_log)
     y_true = np.expm1(y_test)
@@ -103,7 +106,7 @@ def train_dnn_model():
         'Explained Variance': explained_var
     }
 
-    return model, scaler, X.columns.tolist(), metrics
+    return model, scaler, X.columns.tolist(), metrics, zipcode_to_safety
 
 # -------------------------------
 # 🗺️ Fetch Amenities
@@ -160,7 +163,7 @@ def get_nearby_amenities(lat, lon, radius=5000):
         return []
 
 # -------------------------------
-# 🌎 Create NYC Map
+# 🌎 Create Map
 # -------------------------------
 def create_map():
     m = folium.Map(location=[40.7128, -74.0060], zoom_start=12)
@@ -168,20 +171,20 @@ def create_map():
     return m
 
 # -------------------------------
-# 🚀 Streamlit App
+# 🚀 Main Streamlit App
 # -------------------------------
 def main():
     st.set_page_config(page_title="NYC Property Price + Amenities", layout="wide")
-    st.title("🏙️ NYC Property Price Prediction and Amenities Explorer")
+    st.title("🏙️ NYC Property Price Prediction + Amenities Explorer")
 
     st.write("Click anywhere on the map to predict property price and see nearby amenities!")
 
     # Train Model
     with st.spinner('Training DNN model...'):
-        model, scaler, feature_columns, metrics = train_dnn_model()
+        model, scaler, feature_columns, metrics, zipcode_to_safety = train_dnn_model()
 
     # Show Metrics
-    st.subheader("📈 Model Performance on Test Set")
+    st.subheader("📈 Model Performance")
     col1, col2 = st.columns(2)
     with col1:
         st.success(f"**RMSE:** ${metrics['RMSE']:,.2f}")
@@ -198,87 +201,89 @@ def main():
         lat = st_data["last_clicked"]["lat"]
         lon = st_data["last_clicked"]["lng"]
 
-    st.success(f"Clicked at Latitude: {lat:.5f}, Longitude: {lon:.5f}")
+        st.success(f"Clicked at Latitude: {lat:.5f}, Longitude: {lon:.5f}")
 
-    # Optional Inputs
-    st.subheader("🏠 Customize Property Details (Optional)")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        user_bed = st.number_input("Number of Bedrooms", min_value=0, max_value=20, value=0, step=1)
-    with col2:
-        user_bath = st.number_input("Number of Bathrooms", min_value=0, max_value=20, value=0, step=1)
-    with col3:
-        user_area = st.number_input("Area (Sqft)", min_value=0, max_value=10000, value=0, step=50)
+        # User Inputs
+        st.subheader("🏠 Property Details")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            user_bed = st.number_input("Bedrooms", min_value=0, max_value=20, value=0, step=1)
+        with col2:
+            user_bath = st.number_input("Bathrooms", min_value=0, max_value=20, value=0, step=1)
+        with col3:
+            user_area = st.number_input("Area (Sqft)", min_value=0, max_value=10000, value=0, step=50)
 
-    # Dropdown for Property Type
-    property_types = [
-        'Condo for sale', 'Townhouse for sale', 'House for sale',
-        'Co-op for sale', 'Pending', 'Coming Soon', 'Contingent',
-        'Multi-family home for sale', 'Foreclosure', 'Land for sale',
-        'Condop for sale'
-    ]
+        property_types = [
+            'Condo for sale', 'Townhouse for sale', 'House for sale',
+            'Co-op for sale', 'Pending', 'Coming Soon', 'Contingent',
+            'Multi-family home for sale', 'Foreclosure', 'Land for sale', 'Condop for sale'
+        ]
+        selected_type = st.selectbox("🏡 Property Type", property_types)
 
-    selected_type = st.selectbox("🏡 Type of Property", property_types)
+        # Reverse Geocode Zipcode
+        geolocator = Nominatim(user_agent="nyc-property-app")
+        location = geolocator.reverse((lat, lon), exactly_one=True)
+        zipcode = None
+        if location and 'postcode' in location.raw['address']:
+            zipcode = location.raw['address']['postcode']
+            st.info(f"Detected Zip Code: {zipcode}")
 
-    # Prepare Input
-    input_data = {col: 0 for col in feature_columns}
+        # Fetch Amenities
+        with st.spinner('Fetching amenities...'):
+            amenities = get_nearby_amenities(lat, lon, radius=5000)
 
-    # Set numerical features
-    if 'Latitude' in input_data:
-        input_data['Latitude'] = lat
-    if 'Longitude' in input_data:
-        input_data['Longitude'] = lon
-    if 'bed' in input_data and user_bed > 0:
-        input_data['bed'] = user_bed
-    if 'bath' in input_data and user_bath > 0:
-        input_data['bath'] = user_bath
-    if 'Area (Sqft)' in input_data and user_area > 0:
-        input_data['Area (Sqft)'] = user_area
+        amenities_count = {}
+        nearest_distance = {}
 
-    # Set selected Type (one-hot encoded columns)
-    for col in feature_columns:
-        if col.startswith('Type of House_') and selected_type in col:
-            input_data[col] = 1
+        if amenities:
+            amenities_df = pd.DataFrame(amenities)
+            amenities_df['Distance (km)'] = amenities_df['coordinates'].apply(lambda coord: geodesic((lat, lon), coord).kilometers)
 
-    # Scale and Predict
-    input_df = pd.DataFrame([input_data])
-    input_scaled = scaler.transform(input_df)
+            # Process counts and nearest distances
+            amenities_df['Type'] = amenities_df['type'].str.lower()
+            for feature in CATEGORY_FILTERS.keys():
+                feature_lower = feature.lower()
+                count = amenities_df['Type'].str.contains(feature_lower.split()[0]).sum()
+                min_distance = amenities_df[amenities_df['Type'].str.contains(feature_lower.split()[0])]['Distance (km)'].min()
 
-    pred_log_price = model.predict(input_scaled)[0][0]
-    predicted_price = np.expm1(pred_log_price)
+                amenities_count[f"Number_of_{feature.replace(' ', '_')}_Nearby"] = count
+                nearest_distance[f"Distance_to_Nearest_{feature.replace(' ', '_')}_miles_binned"] = min_distance * 0.621371 if not pd.isna(min_distance) else 10.0
 
-    st.subheader("💰 Predicted Property Price")
-    st.write(f"${predicted_price:,.2f}")
+        # Build Input
+        input_data = {col: 0 for col in feature_columns}
+        if 'Latitude' in input_data:
+            input_data['Latitude'] = lat
+        if 'Longitude' in input_data:
+            input_data['Longitude'] = lon
+        if 'bed' in input_data:
+            input_data['bed'] = user_bed
+        if 'bath' in input_data:
+            input_data['bath'] = user_bath
+        if 'Area (Sqft)' in input_data:
+            input_data['Area (Sqft)'] = user_area
+        if 'Safety_Score' in input_data:
+            input_data['Safety_Score'] = zipcode_to_safety.get(int(zipcode), np.median(list(zipcode_to_safety.values()))) if zipcode else np.median(list(zipcode_to_safety.values()))
 
-    # Fetch Amenities
-    with st.spinner('Fetching nearby amenities...'):
-        amenities = get_nearby_amenities(lat, lon, radius=5000)
+        # Property Type
+        for col in feature_columns:
+            if col.startswith('Type of House_') and selected_type in col:
+                input_data[col] = 1
 
-    if amenities:
-        for a in amenities:
-            a['distance_km'] = round(geodesic((lat, lon), a['coordinates']).kilometers, 2)
+        # Amenities Counts and Distances
+        for col in feature_columns:
+            if col in amenities_count:
+                input_data[col] = amenities_count[col]
+            if col in nearest_distance:
+                input_data[col] = nearest_distance[col]
 
-        amenities_df = pd.DataFrame(amenities)
-        amenities_df = amenities_df[['name', 'type', 'distance_km']]
-        amenities_df.columns = ['Name', 'Type', 'Distance (km)']
+        # Predict
+        input_df = pd.DataFrame([input_data])
+        input_scaled = scaler.transform(input_df)
+        pred_log_price = model.predict(input_scaled)[0][0]
+        predicted_price = np.expm1(pred_log_price)
 
-        summary_df = amenities_df.groupby('Type').agg(
-            Number_of_Amenities=('Name', 'count'),
-            Nearest_Distance_km=('Distance (km)', 'min')
-        ).reset_index().sort_values('Nearest_Distance_km')
-
-        st.subheader("📋 Amenities Summary")
-        st.dataframe(summary_df, use_container_width=True)
-
-        csv = summary_df.to_csv(index=False)
-        st.download_button(
-            label="Download Amenities Summary as CSV",
-            data=csv,
-            file_name=f"amenities_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            mime="text/csv",
-        )
-    else:
-        st.warning("No amenities found nearby!")
+        st.subheader("💰 Predicted Property Price")
+        st.write(f"${predicted_price:,.2f}")
 
 if __name__ == "__main__":
     main()
